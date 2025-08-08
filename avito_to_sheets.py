@@ -224,3 +224,11 @@ def process_one_day(token: str, ws, user_id: str, the_date: dt.date, item_ids: L
                     all_stats_for_day.setdefault(iid, {"uniqViews": 0, "uniqContacts": 0})
                     all_stats_for_day[iid]["uniqViews"] += int(s.get("uniqViews", 0) or 0)
                     all_stats_for_day[iid]["uniqContacts"] += int(s.get("uniqContacts", 0) or 0)
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        print(f"[INFO] ERROR: {e}", flush=True)
+        traceback.print_exc()
+        raise
