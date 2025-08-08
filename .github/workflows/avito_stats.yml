@@ -23,7 +23,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests gspread oauth2client
 
-      - name: Run Avito to Sheets
+           - name: Debug: show repo and file
+        run: |
+          pwd
+          ls -la
+          echo "---- file head ----"
+          sed -n '1,120p' avito_to_sheets.py || true
+          echo "---- end head ----"
+
+      - name: Run Avito to Sheets (unbuffered)
         env:
           AVITO_CLIENT_ID: ${{ secrets.AVITO_CLIENT_ID }}
           AVITO_CLIENT_SECRET: ${{ secrets.AVITO_CLIENT_SECRET }}
@@ -31,4 +39,4 @@ jobs:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GOOGLE_SERVICE_JSON: ${{ secrets.GOOGLE_SERVICE_JSON }}
           ITEM_IDS_CSV: ${{ secrets.ITEM_IDS_CSV }}
-        run: python avito_to_sheets.py
+        run: python -u avito_to_sheets.py
