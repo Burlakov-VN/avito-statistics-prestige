@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Avito → Google Sheets (помесячно/понедельно/посуточно через profile-stats)
+Avito → Google Sheets (profile stats + fallback)
 Режимы:
 - По умолчанию: собираем ОДИН день = (сегодня - 3) и пишем на лист 'data'
 - Бэкфилл: задать ENV START_DATE и (опц.) END_DATE (YYYY-MM-DD), скрипт пройдёт по датам включительно
 
 Главное:
-- Пытаемся получить метрики через "статистику профиля" с группировкой по объявлениям и дням.
+- Пытаемся получить метрики через “статистику профиля” с группировкой по объявлениям и дням (item+day).
 - Если профильная ручка недоступна (404/400), fallback на старую /stats/v1...items (uniqViews/uniqContacts).
 - title берём из листинга; VAS (vip, highlight, pushup, premium, xl) — текущее состояние (снимок "сейчас").
 
@@ -14,9 +14,9 @@ ENV (GitHub Secrets обязательные):
   AVITO_CLIENT_ID, AVITO_CLIENT_SECRET, AVITO_USER_ID, SHEET_ID, GOOGLE_SERVICE_JSON
 Опциональные:
   ITEM_IDS_CSV="123,456"        # задать набор ID руками (ускоряет)
-  START_DATE="2025-06-27"
-  END_DATE="2025-08-05"
-  PROFILE_STATS_URL             # на случай, если у вас другой путь, по умолчанию: https://api.avito.ru/stats/v3/accounts/{user_id}/profile
+  START_DATE="YYYY-MM-DD"
+  END_DATE="YYYY-MM-DD"
+  PROFILE_STATS_URL             # если путь отличается, по умолчанию: https://api.avito.ru/stats/v3/accounts/{user_id}/profile
 """
 
 import os
@@ -149,7 +149,6 @@ def list_items_with_titles(token: str, user_id: str, per_page: int = 100) -> Tup
                 vas_id = v.get("vas_id")
                 if vas_id in flags:
                     flags[vas_id] = 1
-            # если vas нет в листинге — заполним позже из item_info, но базовый dict создадим
             vas_flags[iid] = flags
 
         if len(resources) < per_page:
@@ -205,23 +204,20 @@ def fetch_profile_stats_one_day(token: str, user_id: str, day: str, limit: int =
         body = {
             "dateFrom": day,
             "dateTo": day,
-            "grouping": "item",          # получим по объявлениям
+            "grouping": "item",          # данные по объявлениям
             "limit": limit,
             "offset": offset,
             "metrics": PROFILE_METRICS,
-            # Можно добавить фильтр по статусу, если поддерживается в этой ручке:
-            # "filter": {"status": ["active","old","removed","blocked","rejected"]}
+            # "filter": {...}  # если доступно — можно будет включить статус
         }
         r = SESSION.post(url, headers=headers, json=body, timeout=120)
         log(f"POST profile-stats p{page} → {r.status_code}")
         if r.status_code >= 400:
-            # если ручка недоступна — дадим знать верхнему уровню
             log(f"PROFILE BODY: {r.text[:1000]}")
             r.raise_for_status()
 
         data = r.json() or {}
         items = data.get("result") or data.get("items") or data.get("resources") or []
-        # Многие ручки отдают структуру: {"result":{"items":[...]}}
         if "result" in data:
             inner = data["result"]
             items = inner.get("items") or inner.get("data") or items
@@ -230,7 +226,6 @@ def fetch_profile_stats_one_day(token: str, user_id: str, day: str, limit: int =
             break
 
         for it in items:
-            # Ищем поля-ключи
             iid = it.get("itemId") or it.get("item_id") or it.get("itemID")
             d = it.get("date") or it.get("day") or it.get("period")
             if iid and d:
@@ -240,14 +235,12 @@ def fetch_profile_stats_one_day(token: str, user_id: str, day: str, limit: int =
                     continue
                 out.append(it)
 
-        # пагинация
         n = len(items)
         if n < limit:
             break
         offset += limit
         page += 1
-
-        # если лимит 1/мин, притормозим
+        # лимит “1 запрос/мин на метод” — притормозим
         time.sleep(1.0)
 
     return out
@@ -290,6 +283,66 @@ DATA_HEADERS = [
     "vas_flag_vip", "vas_flag_highlight", "vas_flag_pushup", "vas_flag_premium", "vas_flag_xl",
 ]
 
+# Русские подписи для колонок (строка 2)
+HEADER_ALIASES = {
+    "date": "Дата",
+    "item_id": "Номер объявления",
+    "title": "Название объявления",
+
+    # Основные метрики
+    "impressions": "Показы",
+    "views": "Просмотры",
+    "impressionsToViewsConversion": "Конверсия показы→просмотры, %",
+    "contacts": "Контакты всего",
+    "contactsShowPhone": "Посмотрели телефон",
+    "contactsMessenger": "Написали в чат",
+    "contactsShowPhoneAndMessenger": "Телефон и чат",
+    "contactsSbcDiscount": "Скидка в чате (отклик)",
+    "viewsToContactsConversion": "Конверсия просмотры→контакты, %",
+    "favorites": "Добавили в избранное",
+    "averageViewCost": "Средняя цена просмотра",
+    "averageContactCost": "Средняя цена контакта",
+
+    # Fallback-поля из старой ручки
+    "uniqViews": "Просмотры (fallback)",
+    "uniqContacts": "Контакты (fallback)",
+
+    # Расходы
+    "allSpending": "Все расходы",
+    "spending": "Расходы на объявления",
+    "presenceSpending": "Размещение и целевые",
+    "promoSpending": "Продвижение",
+    "restSpending": "Прочие расходы",
+    "commission": "Комиссия",
+    "spendingBonus": "Списано бонусов",
+
+    # VAS (снимок «сейчас»)
+    "vas_ids": "Активные услуги (vas_id)",
+    "vas_finish_time": "Окончание услуг",
+    "vas_next_schedule": "График следующего включения",
+    "vas_flag_vip": "Флаг VAS: vip",
+    "vas_flag_highlight": "Флаг VAS: highlight",
+    "vas_flag_pushup": "Флаг VAS: pushup",
+    "vas_flag_premium": "Флаг VAS: premium",
+    "vas_flag_xl": "Флаг VAS: xl",
+}
+
+def ensure_alias_row(ws):
+    """
+    Делает 2-ю строку с русскими подписями для 1-й строки заголовков
+    и замораживает первые 2 строки.
+    """
+    headers = ws.row_values(1)
+    if not headers:
+        return
+    aliases = [HEADER_ALIASES.get(key, key) for key in headers]
+    ws.resize(rows=max(ws.row_count, 2), cols=max(ws.col_count, len(headers)))
+    ws.update('2:2', [aliases])
+    try:
+        ws.freeze(rows=2, cols=0)
+    except Exception:
+        pass
+
 def connect_sheet():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(GOOGLE_SERVICE_JSON), scope)
@@ -300,6 +353,7 @@ def connect_sheet():
     except gspread.exceptions.WorksheetNotFound:
         ws = sh.add_worksheet(title="data", rows="100000", cols=str(len(DATA_HEADERS) + 10))
         ws.append_row(DATA_HEADERS)
+        ensure_alias_row(ws)
         return ws
 
     # гарантируем заголовки
@@ -311,6 +365,9 @@ def connect_sheet():
     if changed:
         ws.resize(rows=max(ws.row_count, 2), cols=len(headers))
         ws.update("1:1", [headers])
+
+    # русские подписи (строка 2) + заморозка
+    ensure_alias_row(ws)
     return ws
 
 def clear_date(ws, date_str: str):
@@ -339,12 +396,12 @@ def process_one_day(token: str, ws, user_id: str, the_date: dt.date, item_ids: L
     # Кэш для vas/title по item_info (если не было в листинге)
     cache_info: Dict[int, Dict[str, Any]] = {}
 
-    # Почти всегда хотим писать ровно "активные в дату".
+    # Почти всегда хотим писать ровно “активные в дату”.
     active_ids_today: set = set()
 
     # 2) Если есть профильные данные — разложим их по строкам
     if prof:
-        # карта itemId -> {метрики...} (на случай дублей)
+        # карта itemId -> {метрики...}
         agg: Dict[int, Dict[str, Any]] = {}
         for it in prof:
             iid = int(it.get("itemId"))
@@ -353,21 +410,18 @@ def process_one_day(token: str, ws, user_id: str, the_date: dt.date, item_ids: L
                 continue
             active_ids_today.add(iid)
             tgt = agg.setdefault(iid, {})
-            # переносим только известные поля, отсутствующие считаем 0
             for key in PROFILE_METRICS:
                 val = it.get(key, 0)
                 if isinstance(val, (int, float)):
                     tgt[key] = tgt.get(key, 0) + val
                 else:
-                    # иногда приходят строки (конверсии проценты) — оставим как есть
                     tgt[key] = val
 
-        # 3) соберём строки
         for iid in sorted(active_ids_today):
             m = agg.get(iid, {})
             title = titles_from_list.get(iid, "")
 
-            # если в листинге нет title — дотащим по item_info
+            # если в листинге нет title — попробуем item_info
             if not title:
                 if iid not in cache_info:
                     info = get_item_info(token, user_id, iid) or {}
@@ -388,7 +442,6 @@ def process_one_day(token: str, ws, user_id: str, the_date: dt.date, item_ids: L
                 vas_ids = ",".join(v.get("vas_id","") or "" for v in vas_list)
                 vas_finish = ",".join((v.get("finish_time") or "") for v in vas_list)
                 vas_sched = "|".join(",".join(v.get("schedule") or []) for v in vas_list)
-                # возможные доп. флаги
                 for v in vas_list:
                     vid = v.get("vas_id")
                     if vid in flags:
@@ -403,7 +456,7 @@ def process_one_day(token: str, ws, user_id: str, the_date: dt.date, item_ids: L
                 m.get("viewsToContactsConversion", 0),
                 m.get("favorites", 0),
                 m.get("averageViewCost", 0), m.get("averageContactCost", 0),
-                # fallback поля — проф.ручка их обычно не отдаёт, оставим 0
+                # fallback поля — проф.ручка их обычно не отдаёт
                 0, 0,
                 # расходы
                 m.get("allSpending", 0), m.get("spending", 0), m.get("presenceSpending", 0),
@@ -416,9 +469,8 @@ def process_one_day(token: str, ws, user_id: str, the_date: dt.date, item_ids: L
 
         log(f"Active items on {date_str} (profile): {len(rows_out)}")
 
-    # 4) Если профильной статистики нет — fallback: uniqViews/uniqContacts по v1
+    # 3) Если профильной статистики нет — fallback: uniqViews/uniqContacts по v1
     if not prof:
-        # “активные в дату” = есть запись stats на эту дату
         active_map: Dict[int, Dict[str,int]] = {}
         batch_ids = item_ids
         for i in range(0, len(batch_ids), 200):
@@ -439,7 +491,6 @@ def process_one_day(token: str, ws, user_id: str, the_date: dt.date, item_ids: L
 
         log(f"Active items on {date_str} (v1): {len(active_map)}")
 
-        # соберём строки
         for iid, vals in sorted(active_map.items(), key=lambda kv: kv[0]):
             title = titles_from_list.get(iid, "")
             if not title:
@@ -447,7 +498,6 @@ def process_one_day(token: str, ws, user_id: str, the_date: dt.date, item_ids: L
                 title = (info.get("title") or "").strip()
                 time.sleep(0.05)
 
-            # vas snapshot
             info = get_item_info(token, user_id, iid) or {}
             vas_list = info.get("vas") or []
             vas_ids = ",".join(v.get("vas_id","") or "" for v in vas_list)
@@ -478,28 +528,29 @@ def process_one_day(token: str, ws, user_id: str, the_date: dt.date, item_ids: L
             ]
             rows_out.append(row)
 
-    # 5) Запись в таблицу (чистим день → добавляем)
+    # 4) Запись в таблицу (чистим день → добавляем)
     if not rows_out:
         log("No rows — nothing to write.")
         return
 
     # гарантируем порядок заголовков и их наличие
     headers = ws.row_values(1)
-    header_index = {h: i for i, h in enumerate(headers)}
     changed = False
     for h in DATA_HEADERS:
-        if h not in header_index:
+        if h not in headers:
             headers.append(h); changed = True
     if changed:
         ws.resize(rows=max(ws.row_count, 2), cols=len(headers))
         ws.update("1:1", [headers])
-        header_index = {h: i for i, h in enumerate(headers)}
+        # если появились новые колонки — обновим русские подписи
+        ensure_alias_row(ws)
 
+    # удаляем старые строки за этот день, чтобы не было дублей
     clear_date(ws, date_str)
     log(f"Cleared previous rows for {date_str}")
 
-    # если вдруг у нас появились новые колонки после ensure — расширим строки
-    width = len(headers)
+    # выравниваем ширину строк под текущие headers
+    width = len(ws.row_values(1))
     normalized_rows = []
     for r in rows_out:
         if len(r) < width:
