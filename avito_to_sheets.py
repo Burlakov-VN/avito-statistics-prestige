@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Avito → Google Sheets (сбор за 1 день = сегодня-3) с устойчивым листингом
-- /token (client_credentials)
-- Список объявлений:   GET /core/v1/items  (только этот, без 404)
-- Дневная статистика:  POST /stats/v1/accounts/{user_id}/items  (periodGrouping=day)
-- Инфо по объявлению:  GET /core/v1/accounts/{user_id}/items/{item_id}/  (поле vas)
+Avito → Google Sheets (один день = сегодня-3)
+- Авторизация: /token (client_credentials)
+- Список объявлений:   GET /core/v1/accounts/{user_id}/items   (фоллбек: GET /core/v1/items)
+- Дневная статистика:  POST /stats/v1/accounts/{user_id}/items (periodGrouping=day, fields=uniqViews,uniqContacts)
+- Инфо по объявлению:  GET /core/v1/accounts/{user_id}/items/{item_id}/ (поле vas)
 ENV (GitHub Secrets):
   AVITO_CLIENT_ID, AVITO_CLIENT_SECRET, AVITO_USER_ID, SHEET_ID, GOOGLE_SERVICE_JSON
 Опционально:
-  ITEM_IDS_CSV="123,456,789"  — если хочешь собрать только по заданным ID
+  ITEM_IDS_CSV="123,456,789"  # вручную заданный список ID объявлений
 """
 
 import os
@@ -18,36 +18,22 @@ import datetime as dt
 from typing import Dict, List, Tuple
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from requests.adapters import HTTPAdapter, Retry
 
-# ---------- утилиты ----------
+# ---------- логгер ----------
 def log(msg: str) -> None:
     print(f"[INFO] {msg}", flush=True)
 
+# ---------- проверка переменных окружения ----------
 def require_env(name: str) -> str:
     val = os.environ.get(name)
     if not val or not str(val).strip():
         raise RuntimeError(f"ENV '{name}' is missing or empty")
     return val
-
-def make_session() -> requests.Session:
-    """
-    Сессия с повторами и бэкоффом на сетевые таймауты/сбои.
-    """
-    sess = requests.Session()
-    retries = Retry(
-        total=4,                # всего до 4 повторов
-        backoff_factor=0.75,    # 0.75s, 1.5s, 3s, 6s
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET", "POST"],
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retries, pool_connections=20, pool_maxsize=20)
-    sess.mount("https://", adapter)
-    sess.mount("http://", adapter)
-    return sess
 
 # ---------- конфиг ----------
 AVITO_CLIENT_ID = require_env("AVITO_CLIENT_ID")
@@ -57,7 +43,23 @@ SHEET_ID = require_env("SHEET_ID")
 GOOGLE_SERVICE_JSON = require_env("GOOGLE_SERVICE_JSON")
 ITEM_IDS_CSV = os.environ.get("ITEM_IDS_CSV", "").strip()  # опционально
 
-# Общая сессия с ретраями
+# ---------- HTTP с ретраями ----------
+def make_session() -> requests.Session:
+    s = requests.Session()
+    retry = Retry(
+        total=4,
+        read=4,
+        connect=4,
+        backoff_factor=0.8,  # 0.8, 1.6, 2.4...
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "POST"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
 SESSION = make_session()
 
 # ---------- API ----------
@@ -69,7 +71,7 @@ def get_token() -> str:
             "client_id": AVITO_CLIENT_ID,
             "client_secret": AVITO_CLIENT_SECRET,
         },
-        timeout=30,
+        timeout=60,
     )
     log(f"/token → {r.status_code}")
     if r.status_code >= 400:
@@ -80,10 +82,10 @@ def get_token() -> str:
         raise RuntimeError("No access_token in /token response")
     return token
 
-def list_items(token: str, per_page: int = 50, max_pages: int = 30) -> List[int]:
+def list_items(token: str, user_id: str, per_page: int = 100) -> List[int]:
     """
-    Стабильный листинг через /core/v1/items (без account-префикса).
-    Возвращаем ВСЕ id объявлений (любой статус), постранично, с ретраями.
+    Собираем ВСЕ объявления аккаунта (любой статус) с пагинацией.
+    Если аккаунтный эндпоинт вернёт 404 — пробуем общий (fallback).
     """
     ids: List[int] = []
     page = 1
@@ -91,19 +93,22 @@ def list_items(token: str, per_page: int = 50, max_pages: int = 30) -> List[int]
 
     while True:
         url = (
-            "https://api.avito.ru/core/v1/items"
+            f"https://api.avito.ru/core/v1/accounts/{user_id}/items"
             f"?per_page={per_page}&page={page}"
-            "&status=active,old,removed,blocked,rejected"
+            f"&status=active,old,removed,blocked,rejected"
         )
-        try:
-            r = SESSION.get(url, headers=headers, timeout=20)
-        except requests.RequestException as e:
-            log(f"GET items p{page} → EXC {e}")
-            # дадим последний шанс и выйдем
-            break
-
+        r = SESSION.get(url, headers=headers, timeout=60)
         log(f"GET items p{page} → {r.status_code}")
+        if r.status_code == 404:
+            url_fallback = (
+                f"https://api.avito.ru/core/v1/items"
+                f"?per_page={per_page}&page={page}"
+                f"&status=active,old,removed,blocked,rejected"
+            )
+            r = SESSION.get(url_fallback, headers=headers, timeout=60)
+            log(f"GET items (fallback) p{page} → {r.status_code}")
         if r.status_code >= 400:
+            # покажем тело для диагностики и попробуем остановиться
             log(f"ITEMS BODY: {r.text[:800]}")
         r.raise_for_status()
 
@@ -126,17 +131,14 @@ def list_items(token: str, per_page: int = 50, max_pages: int = 30) -> List[int]
                 except Exception:
                     continue
 
-        # если записей меньше per_page — дальше пусто
         if len(resources) < per_page:
             break
 
         page += 1
-        if page > max_pages:
-            log(f"Reached max_pages={max_pages}, stop listing.")
+        if page > 100:  # защита от зацикливания
             break
 
-        # мягкий троттлинг, чтобы не ловить rate-limit
-        time.sleep(0.15)
+        time.sleep(0.2)  # мягкий троттлинг
 
     ids = sorted(set(ids))
     log(f"Items found: {len(ids)}")
@@ -147,9 +149,8 @@ def stats_v1(token: str, user_id: str, item_ids: List[int],
     """
     Дневная статистика:
       POST /stats/v1/accounts/{user_id}/items
-      fields: ["uniqViews","uniqContacts"]
-      itemIds: до 200 за запрос
-      periodGrouping: "day"
+      fields: ["uniqViews","uniqContacts"], periodGrouping="day"
+      itemIds: максимум 200 за запрос
     """
     url = f"https://api.avito.ru/stats/v1/accounts/{user_id}/items"
     body = {
@@ -159,7 +160,7 @@ def stats_v1(token: str, user_id: str, item_ids: List[int],
         "itemIds": item_ids[:200],
         "periodGrouping": "day",
     }
-    r = SESSION.post(url, json=body, headers={"Authorization": f"Bearer {token}"}, timeout=40)
+    r = SESSION.post(url, json=body, headers={"Authorization": f"Bearer {token}"}, timeout=120)
     log(f"POST v1 stats batch({len(body['itemIds'])}) → {r.status_code}")
     if r.status_code >= 400:
         log(f"STATS BODY: {r.text[:1000]}")
@@ -172,7 +173,7 @@ def get_item_info(token: str, user_id: str, item_id: int) -> Dict:
       GET /core/v1/accounts/{user_id}/items/{item_id}/
     """
     url = f"https://api.avito.ru/core/v1/accounts/{user_id}/items/{item_id}/"
-    r = SESSION.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=25)
+    r = SESSION.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=60)
     if r.status_code == 404:
         log(f"item {item_id} → 404 (skip)")
         return {}
@@ -189,4 +190,109 @@ def connect_sheet():
     sh = gc.open_by_key(SHEET_ID)
     try:
         ws = sh.worksheet("data")
-    except gspread.exceptions.WorksheetN
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title="data", rows="50000", cols="20")
+        ws.append_row([
+            "date", "item_id", "title",
+            "uniqViews", "uniqContacts",
+            "vas_ids", "vas_finish_time", "vas_next_schedule"
+        ])
+    return ws
+
+# ---------- main ----------
+def main():
+    log("== Avito → Google Sheets collector start ==")
+
+    # === собираем РОВНО один день = сегодня-3 ===
+    today = dt.date.today()
+    target_date = (today - dt.timedelta(days=3)).strftime("%Y-%m-%d")
+    date_from = target_date
+    date_to = target_date
+    log(f"Period (single day): {date_from} → {date_to}")
+
+    token = get_token()
+
+    # 1) Список объявлений (или используем ручной список из ITEM_IDS_CSV)
+    if ITEM_IDS_CSV:
+        item_ids: List[int] = []
+        for chunk in ITEM_IDS_CSV.split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            try:
+                item_ids.append(int(chunk))
+            except Exception:
+                pass
+        item_ids = sorted(set(item_ids))
+        log(f"ITEM_IDS_CSV provided, using {len(item_ids)} ids")
+    else:
+        item_ids = list_items(token, AVITO_USER_ID)
+
+    if not item_ids:
+        log("Нет объявлений — статистику собрать не из чего. (Можно задать ITEM_IDS_CSV)")
+        return
+
+    # 2) Забираем статистику пачками по 200 id
+    all_stats: Dict[Tuple[str, str], Dict[str, int]] = {}  # (date, itemId) -> {uniqViews, uniqContacts}
+    for i in range(0, len(item_ids), 200):
+        batch = item_ids[i:i+200]
+        resp = stats_v1(token, AVITO_USER_ID, batch, date_from, date_to)
+        items = (((resp or {}).get("result") or {}).get("items")) or []
+        for it in items:
+            iid = str(it.get("itemId") or it.get("item_id") or "")
+            if not iid:
+                continue
+            for s in it.get("stats", []):
+                d = s.get("date")
+                if not d:
+                    continue
+                key = (d, iid)
+                rec = all_stats.setdefault(key, {"uniqViews": 0, "uniqContacts": 0})
+                rec["uniqViews"] += int(s.get("uniqViews", 0) or 0)
+                rec["uniqContacts"] += int(s.get("uniqContacts", 0) or 0)
+        time.sleep(0.2)  # мягкий троттлинг
+
+    log(f"Stat points collected: {len(all_stats)}")
+    if not all_stats:
+        log("API вернул пустую статистику за этот день.")
+        return
+
+    # 3) Пишем в Google Sheets и подтягиваем VAS/Title (кэшируем ответы)
+    ws = connect_sheet()
+    rows: List[List[str]] = []
+    cache_info: Dict[str, Dict] = {}
+
+    for (d, iid), vals in sorted(all_stats.items()):
+        if iid not in cache_info:
+            info = get_item_info(token, AVITO_USER_ID, int(iid)) or {}
+            vas = info.get("vas") or []
+            cache_info[iid] = {
+                "title": info.get("title", "") or "",
+                "vas_ids": ",".join(v.get("vas_id", "") or "" for v in vas),
+                "finish": ",".join((v.get("finish_time") or "") for v in vas),
+                "sched": "|".join(",".join(v.get("schedule") or []) for v in vas),
+            }
+            time.sleep(0.15)
+
+        ci = cache_info[iid]
+        rows.append([
+            d, iid, ci["title"],
+            vals.get("uniqViews", 0), vals.get("uniqContacts", 0),
+            ci["vas_ids"], ci["finish"], ci["sched"]
+        ])
+
+    if rows:
+        log(f"Appending {len(rows)} rows to Google Sheets…")
+        ws.append_rows(rows, value_input_option="USER_ENTERED")
+        log("Done.")
+    else:
+        log("Сформированных строк нет (rows пуст).")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        log(f"ERROR: {e}")
+        traceback.print_exc()
+        raise
