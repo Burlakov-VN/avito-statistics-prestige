@@ -1,0 +1,27 @@
+name: Avito → Google Sheets (daily)
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "10 4 * * *"  # ежедневно в 04:10 UTC
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests gspread oauth2client
+      - name: Run script
+        env:
+          AVITO_CLIENT_ID: ${{ secrets.AVITO_CLIENT_ID }}
+          AVITO_CLIENT_SECRET: ${{ secrets.AVITO_CLIENT_SECRET }}
+          AVITO_USER_ID: ${{ secrets.AVITO_USER_ID }}   # 363007001
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GOOGLE_SERVICE_JSON: ${{ secrets.GOOGLE_SERVICE_JSON }}
+        run: python avito_to_sheets.py
