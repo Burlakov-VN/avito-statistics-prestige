@@ -1,7 +1,7 @@
 name: Avito Stats Daily
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
   schedule:
     - cron: "0 5 * * *"   # ежедневно 05:00 UTC (~08:00 МСК)
 
@@ -24,14 +24,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests gspread oauth2client
 
-      - name: Debug: show repo and file
-        run: |
-          pwd
-          ls -la
-          echo "---- file head ----"
-          sed -n '1,120p' avito_to_sheets.py || true
-          echo "---- end head ----"
-
       - name: Run Avito to Sheets (unbuffered)
         env:
           AVITO_CLIENT_ID: ${{ secrets.AVITO_CLIENT_ID }}
@@ -39,7 +31,7 @@ jobs:
           AVITO_USER_ID: ${{ secrets.AVITO_USER_ID }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GOOGLE_SERVICE_JSON: ${{ secrets.GOOGLE_SERVICE_JSON }}
-          ITEM_IDS_CSV: ${{ secrets.ITEM_IDS_CSV }}   # опционально
-          START_DATE: ${{ secrets.START_DATE }}       # опционально для бэкфилла
-          END_DATE: ${{ secrets.END_DATE }}           # опционально для бэкфилла
+          ITEM_IDS_CSV: ${{ secrets.ITEM_IDS_CSV }}
+          START_DATE: ${{ secrets.START_DATE }}
+          END_DATE: ${{ secrets.END_DATE }}
         run: python -u avito_to_sheets.py
