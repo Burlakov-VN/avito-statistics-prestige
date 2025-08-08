@@ -223,4 +223,4 @@ def process_one_day(token: str, ws, user_id: str, the_date: dt.date, item_ids: L
                     # считаем, что раз есть запись за день — объявление было активно в этот день
                     all_stats_for_day.setdefault(iid, {"uniqViews": 0, "uniqContacts": 0})
                     all_stats_for_day[iid]["uniqViews"] += int(s.get("uniqViews", 0) or 0)
-                    all_stats_for_day[iid]["uniqContacts"] += int(s.get("uniqContacts", 0) or 0)_
+                    all_stats_for_day[iid]["uniqContacts"] += int(s.get("uniqContacts", 0) or 0)
